@@ -470,23 +470,30 @@ describe("ProviderSessionReaper", () => {
     ]);
   });
 
-  it("still reaps a stale session when the wakeup check fails", async () => {
+  it("skips a stale session when the wakeup check fails and retries next sweep", async () => {
     const threadId = ThreadId.make("thread-reaper-wakeup-check-fails");
+    let checks = 0;
     const harness = await createHarness({
       readModel: makeReadModel([idleClaudeThread(threadId)]),
       hasPendingWakeupsImplementation: () =>
-        Effect.fail(
-          new ProviderValidationError({
-            operation: "ProviderService.hasPendingWakeups",
-            issue: "no binding",
-          }),
-        ),
+        checks++ === 0
+          ? Effect.fail(
+              new ProviderValidationError({
+                operation: "ProviderService.hasPendingWakeups",
+                issue: "transient routing failure",
+              }),
+            )
+          : Effect.succeed(false),
     });
     await seedStaleClaudeSession(threadId);
+    const sweepTimeMs = Date.parse("2026-04-15T00:00:00.000Z");
 
-    await startReaper();
-    await waitFor(() => harness.stopSession.mock.calls.length === 1);
+    await sweepAt(sweepTimeMs);
+    expect(checks).toBe(1);
+    expect(harness.stopSession).not.toHaveBeenCalled();
 
+    await sweepAt(sweepTimeMs);
+    expect(checks).toBe(2);
     expect(harness.stoppedThreadIds.has(threadId)).toBe(true);
   });
 
