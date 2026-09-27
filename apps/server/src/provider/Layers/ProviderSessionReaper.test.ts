@@ -178,6 +178,7 @@ describe("ProviderSessionReaper", () => {
     readonly stopSessionImplementation?: (input: {
       readonly threadId: ThreadId;
     }) => ReturnType<ProviderServiceShape["stopSession"]>;
+    readonly hasPendingWakeupsImplementation?: ProviderServiceShape["hasPendingWakeups"];
   }) {
     const stoppedThreadIds = new Set<ThreadId>();
     const stopSession = vi.fn<ProviderServiceShape["stopSession"]>(
@@ -198,6 +199,7 @@ describe("ProviderSessionReaper", () => {
       respondToUserInput: () => unsupported(),
       stopSession,
       listSessions: () => Effect.succeed([]),
+      hasPendingWakeups: input.hasPendingWakeupsImplementation ?? (() => Effect.succeed(false)),
       getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
       assertConversationRollbackSupported: () => unsupported(),
       getInstanceInfo: (instanceId) => {
@@ -413,6 +415,79 @@ describe("ProviderSessionReaper", () => {
     expect(harness.stopSession).not.toHaveBeenCalled();
     const remaining = await runtime!.runPromise(repository.getByThreadId({ threadId }));
     expect(Option.isSome(remaining)).toBe(true);
+  });
+
+  async function seedStaleClaudeSession(threadId: ThreadId) {
+    const repository = await runtime!.runPromise(
+      Effect.service(ProviderSessionRuntime.ProviderSessionRuntimeRepository),
+    );
+    await runtime!.runPromise(
+      repository.upsert({
+        threadId,
+        providerName: "claudeAgent",
+        providerInstanceId: null,
+        adapterKey: "claudeAgent",
+        runtimeMode: "full-access",
+        status: "running",
+        lastSeenAt: "2026-04-14T00:00:00.000Z",
+        resumeCursor: { opaque: `resume-${threadId}` },
+        runtimePayload: null,
+      }),
+    );
+  }
+
+  function idleClaudeThread(threadId: ThreadId) {
+    return {
+      id: threadId,
+      session: {
+        threadId,
+        status: "ready" as const,
+        providerName: "claudeAgent" as const,
+        runtimeMode: "full-access" as const,
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+    };
+  }
+
+  it("skips stale sessions that have scheduled wakeups pending", async () => {
+    const waitingThreadId = ThreadId.make("thread-reaper-pending-wakeups");
+    const idleThreadId = ThreadId.make("thread-reaper-no-wakeups");
+    const harness = await createHarness({
+      readModel: makeReadModel([idleClaudeThread(waitingThreadId), idleClaudeThread(idleThreadId)]),
+      hasPendingWakeupsImplementation: (threadId) => Effect.succeed(threadId === waitingThreadId),
+    });
+    await seedStaleClaudeSession(waitingThreadId);
+    await seedStaleClaudeSession(idleThreadId);
+
+    await startReaper();
+    await waitFor(() => harness.stopSession.mock.calls.length === 1);
+    await Effect.runPromise(drainFibers);
+
+    expect(harness.stopSession.mock.calls.map(([request]) => request.threadId)).toEqual([
+      idleThreadId,
+    ]);
+  });
+
+  it("still reaps a stale session when the wakeup check fails", async () => {
+    const threadId = ThreadId.make("thread-reaper-wakeup-check-fails");
+    const harness = await createHarness({
+      readModel: makeReadModel([idleClaudeThread(threadId)]),
+      hasPendingWakeupsImplementation: () =>
+        Effect.fail(
+          new ProviderValidationError({
+            operation: "ProviderService.hasPendingWakeups",
+            issue: "no binding",
+          }),
+        ),
+    });
+    await seedStaleClaudeSession(threadId);
+
+    await startReaper();
+    await waitFor(() => harness.stopSession.mock.calls.length === 1);
+
+    expect(harness.stoppedThreadIds.has(threadId)).toBe(true);
   });
 
   it.each(["ready", "interrupted", "error"] as const)(

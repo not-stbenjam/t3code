@@ -127,6 +127,13 @@ export interface ProviderAdapterShape<TError> {
   readonly hasSession: (threadId: ThreadId) => Effect.Effect<boolean>;
 
   /**
+   * Check whether an active session has scheduled work that will wake it
+   * later, such as Claude `CronCreate` jobs. That schedule lives in the
+   * provider process, so stopping the session cancels it.
+   */
+  readonly hasPendingWakeups?: (threadId: ThreadId) => Effect.Effect<boolean>;
+
+  /**
    * Read a provider thread snapshot.
    */
   readonly readThread: (threadId: ThreadId) => Effect.Effect<ProviderThreadSnapshot, TError>;

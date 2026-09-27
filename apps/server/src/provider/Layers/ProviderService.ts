@@ -2191,6 +2191,20 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     },
   );
 
+  const hasPendingWakeups: ProviderServiceMethod<"hasPendingWakeups"> = Effect.fn(
+    "hasPendingWakeups",
+  )(function* (threadId) {
+    const routed = yield* resolveRoutableSession({
+      threadId,
+      operation: "ProviderService.hasPendingWakeups",
+      allowRecovery: false,
+    });
+    if (!routed.isActive || !routed.adapter.hasPendingWakeups) {
+      return false;
+    }
+    return yield* routed.adapter.hasPendingWakeups(routed.threadId);
+  });
+
   const getCapabilities: ProviderServiceMethod<"getCapabilities"> = (instanceId) =>
     registry.getByInstance(instanceId).pipe(Effect.map((adapter) => adapter.capabilities));
 
@@ -2423,6 +2437,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     respondToUserInput,
     stopSession,
     listSessions,
+    hasPendingWakeups,
     getCapabilities,
     getInstanceInfo,
     assertConversationRollbackSupported,

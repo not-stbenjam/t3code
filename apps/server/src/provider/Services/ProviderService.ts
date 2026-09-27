@@ -96,6 +96,12 @@ export interface ProviderServiceShape {
   readonly listSessions: () => Effect.Effect<ReadonlyArray<ProviderSession>>;
 
   /**
+   * Check whether the thread's active session has scheduled work that will
+   * wake it later. False when the session is not active.
+   */
+  readonly hasPendingWakeups: (threadId: ThreadId) => Effect.Effect<boolean, ProviderServiceError>;
+
+  /**
    * Read capabilities for the adapter bound to a configured provider instance.
    */
   readonly getCapabilities: (

@@ -64,6 +64,7 @@ const makeProviderService = (liveThreadIds: ReadonlyArray<ThreadId> = []) =>
     respondToUserInput: () => Effect.die("unused"),
     stopSession: () => Effect.die("unused"),
     listSessions: () => Effect.succeed(liveThreadIds.map((threadId) => ({ threadId }) as never)),
+    hasPendingWakeups: () => Effect.succeed(false),
     getCapabilities: () => Effect.die("unused"),
     assertConversationRollbackSupported: () => Effect.die("unused"),
     getInstanceInfo: () => Effect.die("unused"),
@@ -699,6 +700,7 @@ it.effect("does not fail startup when the live provider session inventory cannot
     Effect.provideService(ProviderService.ProviderService, {
       ...makeProviderService(),
       listSessions: () => Effect.die("provider inventory unavailable"),
+      hasPendingWakeups: () => Effect.succeed(false),
     }),
     Effect.provideService(ProviderSessionDirectory.ProviderSessionDirectory, {
       getBinding: () => Effect.die("unused"),

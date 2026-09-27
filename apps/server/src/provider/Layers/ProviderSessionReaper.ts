@@ -92,6 +92,26 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
           continue;
         }
 
+        // Scheduled wakeups (Claude CronCreate, /loop) are held by the
+        // provider process and only fire while it runs. They produce no task
+        // lifecycle, so they never show up as background liveness.
+        const hasPendingWakeups = yield* providerService.hasPendingWakeups(binding.threadId).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider.session.reaper.pending-wakeups-check-failed", {
+              threadId: binding.threadId,
+              provider: binding.provider,
+              cause,
+            }).pipe(Effect.as(false)),
+          ),
+        );
+        if (hasPendingWakeups) {
+          yield* Effect.logDebug("provider.session.reaper.skipped-pending-wakeups", {
+            threadId: binding.threadId,
+            idleDurationMs,
+          });
+          continue;
+        }
+
         const reaped = yield* providerService.stopSession({ threadId: binding.threadId }).pipe(
           Effect.tap(() =>
             Effect.logInfo("provider.session.reaped", {

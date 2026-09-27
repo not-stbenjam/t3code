@@ -11,6 +11,7 @@
 import * as NodeUtil from "node:util";
 import {
   type CanUseTool,
+  type HookCallback,
   query,
   getSessionMessages,
   forkSession,
@@ -457,6 +458,11 @@ interface ClaudeSessionContext {
   announcedUsageLimits: { turnId: string; keys: Set<string> } | undefined;
   /** Resolved by completeTurn while Stop waits for Claude to abort the turn. */
   interruptedTurnSettled: Deferred.Deferred<void> | undefined;
+  /**
+   * Scheduled wakeups (CronCreate, ScheduleWakeup, /loop) from the latest
+   * Stop hook. A resumed process restores them before its first Stop.
+   */
+  sessionCronCount: number;
   stopped: boolean;
 }
 
@@ -4826,6 +4832,19 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         request,
         callbackOptions,
       ) => runPromise(handleResumeDialog(request, callbackOptions));
+      // Stop reports the session's full cron list each time, so the latest
+      // payload replaces the count. CLIs that omit the field report none.
+      const recordSessionCrons: HookCallback = (hookInput) =>
+        runPromise(
+          Ref.get(contextRef).pipe(
+            Effect.map((context) => {
+              if (context && hookInput.hook_event_name === "Stop") {
+                context.sessionCronCount = hookInput.session_crons?.length ?? 0;
+              }
+              return {};
+            }),
+          ),
+        );
 
       const claudeBinaryPath = claudeSdkExecutablePath;
       const {
@@ -4944,6 +4963,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         canUseTool,
         onUserDialog,
         supportedDialogKinds: ["resume_return"],
+        hooks: { Stop: [{ hooks: [recordSessionCrons] }] },
         env: McpProviderSession.withAgentDeviceEnvironment(claudeEnvironment, mcpSession),
         additionalDirectories,
         ...(Object.keys(extraArgs).length > 0 ? { extraArgs } : {}),
@@ -5055,6 +5075,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         lastThreadStartedId: undefined,
         announcedUsageLimits: undefined,
         interruptedTurnSettled: undefined,
+        sessionCronCount: 0,
         stopped: false,
       };
       yield* Ref.set(contextRef, context);
@@ -5555,6 +5576,12 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       return context !== undefined && !context.stopped;
     });
 
+  const hasPendingWakeups: NonNullable<ClaudeAdapterShape["hasPendingWakeups"]> = (threadId) =>
+    Effect.sync(() => {
+      const context = sessions.get(threadId);
+      return context !== undefined && !context.stopped && context.sessionCronCount > 0;
+    });
+
   const stopSessions = Effect.fn("stopSessions")(function* (
     contexts: ReadonlyArray<ClaudeSessionContext>,
     emitExitEvent: boolean,
@@ -5599,6 +5626,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     stopSession,
     listSessions,
     hasSession,
+    hasPendingWakeups,
     stopAll,
     get streamEvents() {
       return Stream.fromQueue(runtimeEventQueue);

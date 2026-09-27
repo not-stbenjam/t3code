@@ -464,6 +464,64 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("reports pending wakeups from the latest Stop hook cron list", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      const stopHook = harness.getLastCreateQueryInput()?.options.hooks?.Stop?.[0]?.hooks[0];
+      assert.equal(typeof stopHook, "function");
+      if (!stopHook || !adapter.hasPendingWakeups) {
+        return;
+      }
+      const hasPendingWakeups = adapter.hasPendingWakeups;
+      const fireStop = (sessionCrons?: ReadonlyArray<{ id: string }>) =>
+        Effect.promise(() =>
+          stopHook(
+            {
+              hook_event_name: "Stop",
+              session_id: "claude-session",
+              transcript_path: "/tmp/transcript.jsonl",
+              cwd: "/tmp",
+              stop_hook_active: false,
+              ...(sessionCrons
+                ? {
+                    session_crons: sessionCrons.map(({ id }) => ({
+                      id,
+                      schedule: "*/10 * * * *",
+                      recurring: true,
+                      prompt: "check the PR",
+                    })),
+                  }
+                : {}),
+            },
+            undefined,
+            { signal: new AbortController().signal },
+          ),
+        );
+
+      assert.equal(yield* hasPendingWakeups(THREAD_ID), false);
+      yield* fireStop([{ id: "cron-a" }, { id: "cron-b" }]);
+      assert.equal(yield* hasPendingWakeups(THREAD_ID), true);
+      yield* fireStop([]);
+      assert.equal(yield* hasPendingWakeups(THREAD_ID), false);
+      yield* fireStop([{ id: "cron-c" }]);
+      yield* fireStop();
+      assert.equal(yield* hasPendingWakeups(THREAD_ID), false);
+
+      yield* fireStop([{ id: "cron-d" }]);
+      yield* adapter.stopSession(THREAD_ID);
+      assert.equal(yield* hasPendingWakeups(THREAD_ID), false);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("derives auto permission mode from auto runtime policy without skip flag", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
