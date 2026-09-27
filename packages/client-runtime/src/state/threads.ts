@@ -457,7 +457,8 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         Effect.annotateLogs({
           environmentId,
           threadId,
-          eventType: item.eventType,
+          // Bounded: the type comes from a newer server and is not validated here.
+          eventType: item.eventType.slice(0, 64),
           sequence: item.sequence,
         }),
       );
