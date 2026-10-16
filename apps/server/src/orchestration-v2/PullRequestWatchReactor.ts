@@ -1,6 +1,7 @@
 import {
   CommandId,
   MessageId,
+  type OrchestrationV2DomainEvent,
   type OrchestrationV2Notification,
   type PullRequestActivity,
   type PullRequestComment,
@@ -25,6 +26,8 @@ import * as Option from "effect/Option";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
 
 import {
   type ProviderChangeRequestWatchFingerprint,
@@ -183,6 +186,7 @@ export class PullRequestWatchReactor extends Context.Service<
   {
     readonly start: () => Effect.Effect<void, never, Scope.Scope>;
     readonly sweep: Effect.Effect<void>;
+    readonly handle: (event: OrchestrationV2DomainEvent) => Effect.Effect<void>;
   }
 >()("t3/orchestration-v2/PullRequestWatchReactor") {}
 
@@ -496,7 +500,8 @@ export const make = Effect.gen(function* () {
     });
   });
 
-  const sweep = Effect.gen(function* () {
+  /** Reads every watched pull request, or only those `threadId` watches. */
+  const sweepFor = Effect.fn("PullRequestWatchReactor.sweep")(function* (threadId?: string) {
     const threads = yield* projections.getThreadsWithPullRequests();
     const targets = threads.flatMap((thread) =>
       visibleThreadPullRequests(thread.pullRequests ?? []).flatMap((link) =>
@@ -545,11 +550,15 @@ export const make = Effect.gen(function* () {
         ),
       { discard: true },
     );
-    const fingerprints = yield* Effect.forEach(groups, fingerprintOf, {
+    const due =
+      threadId === undefined
+        ? groups
+        : groups.filter((group) => group.targets.some((target) => target.thread.id === threadId));
+    const fingerprints = yield* Effect.forEach(due, fingerprintOf, {
       concurrency: "unbounded",
     });
     yield* Effect.forEach(
-      groups,
+      due,
       (group, index) => {
         const fingerprint = fingerprints[index]!;
         return fingerprint === "paused"
@@ -562,17 +571,60 @@ export const make = Effect.gen(function* () {
       },
       { concurrency: 4, discard: true },
     );
-  }).pipe(
-    Effect.catchCause(logFailure("pull request watch sweep failed", {})),
-    Effect.withSpan("PullRequestWatchReactor.sweep"),
-  );
+  });
+
+  // Two passes reading one pull request at once would both report the same remark.
+  const passes = yield* Semaphore.make(1);
+  const pass = (threadId?: string) =>
+    sweepFor(threadId).pipe(
+      passes.withPermits(1),
+      Effect.catchCause(logFailure("pull request watch sweep failed", {})),
+    );
+  const sweep = pass();
+
+  const turnEnded = (event: OrchestrationV2DomainEvent) =>
+    event.type === "run.updated" && event.payload.status === "completed";
+
+  // News that lands after a turn's last pass would otherwise wait up to a whole sweep, and a user
+  // message sent meanwhile starts a turn the wake then has to queue behind.
+  const handle: PullRequestWatchReactor["Service"]["handle"] = (event) =>
+    !turnEnded(event)
+      ? Effect.void
+      : projections.getThreadsWithPullRequests(event.threadId).pipe(
+          Effect.flatMap((threads) =>
+            threads.some((thread) =>
+              visibleThreadPullRequests(thread.pullRequests ?? []).some(
+                (link) => link.watch !== undefined,
+              ),
+            )
+              ? pass(event.threadId)
+              : Effect.void,
+          ),
+          Effect.catchCause(
+            logFailure("pull request watch turn-end check failed", { threadId: event.threadId }),
+          ),
+        );
 
   const start: PullRequestWatchReactor["Service"]["start"] = () =>
-    forkParked(
-      sweep.pipe(Effect.repeat(Schedule.spaced(`${SWEEP_MINUTES} minutes`)), Effect.asVoid),
+    Effect.all(
+      [
+        forkParked(
+          sweep.pipe(Effect.repeat(Schedule.spaced(`${SWEEP_MINUTES} minutes`)), Effect.asVoid),
+        ),
+        // Concurrent so a check waiting on a sweep never holds up the event stream.
+        forkParked(
+          engine.streamDomainEvents.pipe(
+            Stream.filter(turnEnded),
+            Stream.mapEffect(handle, { concurrency: "unbounded", unordered: true }),
+            Stream.runDrain,
+            Effect.catchCause(logFailure("pull request watch event stream failed", {})),
+          ),
+        ),
+      ],
+      { discard: true },
     );
 
-  return { start, sweep } satisfies PullRequestWatchReactor["Service"];
+  return { start, sweep, handle } satisfies PullRequestWatchReactor["Service"];
 });
 
 export const layer = Layer.effect(PullRequestWatchReactor, make);

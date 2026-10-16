@@ -2906,6 +2906,145 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  it.effect("a review posted during a turn wakes the thread as soon as the turn ends", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const projectId = ProjectId.make("pr-watch-turn-end-project");
+      const threadId = ThreadId.make("runtime-pull-request-watch-turn-end");
+      yield* seedProject({
+        projectId,
+        title: "Watch turn end",
+        workspaceRoot: "/workspace/watch-turn-end",
+        defaultModelSelection: null,
+        createdAt: "2026-10-01T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("pr-watch-turn-end-create"),
+        threadId,
+        projectId,
+        title: "Watch turn end",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make("pr-watch-turn-end-start"),
+        threadId,
+        host: "github.com",
+        repository: "pingdotgg/t3code",
+        number: 12,
+        watching: true,
+        link: { url: "https://github.com/pingdotgg/t3code/pull/12", source: "agent" },
+      });
+
+      let fingerprint = { status: "OPEN settled", remarks: "0" };
+      let comments: Array<PullRequestComment> = [];
+      const reactor = yield* PullRequestWatchReactor.make.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            Layer.mock(PullRequestService.PullRequestService)({
+              watchFingerprint: () => Effect.sync(() => fingerprint),
+              invalidate: () => Effect.void,
+              detail: () =>
+                Effect.succeed({
+                  ...watchedPullRequestDetail({ projectId, number: 12, at: "2026-10-16" }),
+                  checks: [],
+                }),
+              activity: () =>
+                Effect.sync(() => ({
+                  comments,
+                  commentCount: comments.length,
+                  commentsTruncated: false,
+                  reviewThreads: [],
+                  commits: [],
+                })),
+            }),
+          ),
+        ),
+      );
+      const wakes = Effect.map(orchestrator.getThreadProjection(threadId), ({ messages }) =>
+        messages.filter((message) => message.notification !== undefined),
+      );
+      const send = (name: string) =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`pr-watch-turn-end-${name}`),
+          threadId,
+          messageId: MessageId.make(`pr-watch-turn-end-${name}`),
+          text: name,
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+
+      yield* reactor.sweep;
+      yield* send("first");
+      const turn = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+
+      // Lands after the turn's last pass, so only the end of the turn can catch it.
+      const reviewer = { login: "chatgpt-codex-connector", name: null, avatarUrl: null };
+      comments = [
+        {
+          id: "review-1",
+          kind: "review",
+          author: reviewer,
+          body: "Codex Review: some suggestions.",
+          createdAt: "2026-10-16T12:30:41.000Z",
+          url: null,
+          path: null,
+          reviewState: "COMMENTED",
+        },
+        ...["review-comment-1", "review-comment-2"].map((id): PullRequestComment => ({
+          id,
+          kind: "review-comment",
+          author: reviewer,
+          body: `Inline ${id}`,
+          createdAt: "2026-10-16T12:30:41.000Z",
+          url: null,
+          path: "src/client.ts",
+          reviewState: null,
+        })),
+      ];
+      fingerprint = { status: "OPEN settled", remarks: "1" };
+      const now = yield* DateTime.now;
+      const ended = {
+        id: EventId.make("pr-watch-turn-end-completed"),
+        type: "run.updated" as const,
+        threadId,
+        runId: turn.id,
+        occurredAt: now,
+        payload: { ...turn, status: "completed" as const, completedAt: now },
+      };
+      yield* eventSink.write({ events: [ended] });
+      yield* reactor.handle(ended);
+      yield* send("second");
+
+      const [wake, ...others] = yield* wakes;
+      assert.deepEqual(others, []);
+      assert.include(wake?.text, "3 new comments");
+      assert.include(wake?.text, "chatgpt-codex-connector on src/client.ts");
+      const { runs } = yield* orchestrator.getThreadProjection(threadId);
+      const runOf = (messageId: string) => runs.find((run) => run.userMessageId === messageId);
+      assert.notEqual(runOf(wake!.id)?.status, "queued");
+      assert.equal(runOf("pr-watch-turn-end-second")?.status, "queued");
+
+      yield* reactor.handle(ended);
+      yield* TestClock.adjust("30 minutes");
+      yield* reactor.sweep;
+      assert.equal((yield* wakes).length, 1);
+    }),
+  );
+
   it.effect.each([
     "single page",
     "paginated",
