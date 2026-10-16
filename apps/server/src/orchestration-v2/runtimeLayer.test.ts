@@ -3045,6 +3045,123 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  it.effect("unwatching drops the pull request's wakes still queued behind a turn", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projectId = ProjectId.make("pr-watch-unwatch-queued-project");
+      const threadId = ThreadId.make("runtime-pull-request-watch-unwatch-queued");
+      yield* seedProject({
+        projectId,
+        title: "Unwatch queued",
+        workspaceRoot: "/workspace/watch-unwatch-queued",
+        defaultModelSelection: null,
+        createdAt: "2026-10-01T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("pr-watch-unwatch-queued-create"),
+        threadId,
+        projectId,
+        title: "Unwatch queued",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      const watch = (number: number, watching: boolean) =>
+        orchestrator.dispatch({
+          type: "thread.pull-request.watch",
+          commandId: CommandId.make(`pr-watch-unwatch-queued-${number}-${watching}`),
+          threadId,
+          host: "github.com",
+          repository: "pingdotgg/t3code",
+          number,
+          watching,
+          link: { url: `https://github.com/pingdotgg/t3code/pull/${number}`, source: "agent" },
+        });
+      yield* watch(13, true);
+      yield* watch(14, true);
+      const send = (name: string) =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`pr-watch-unwatch-queued-${name}`),
+          threadId,
+          messageId: MessageId.make(`pr-watch-unwatch-queued-${name}`),
+          text: name,
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+
+      let comments: Array<PullRequestComment> = [];
+      const reactor = yield* PullRequestWatchReactor.make.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            Layer.mock(PullRequestService.PullRequestService)({
+              detail: (input) =>
+                Effect.succeed({
+                  ...watchedPullRequestDetail({
+                    projectId,
+                    number: input.number,
+                    at: "2026-10-16",
+                  }),
+                  checks: [],
+                }),
+              activity: () =>
+                Effect.sync(() => ({
+                  comments,
+                  commentCount: comments.length,
+                  commentsTruncated: false,
+                  reviewThreads: [],
+                  commits: [],
+                })),
+            }),
+          ),
+        ),
+      );
+      yield* reactor.sweep;
+      yield* send("busy");
+      comments = [
+        {
+          id: "coderabbit-edit",
+          kind: "issue-comment",
+          author: { login: "coderabbitai", name: null, avatarUrl: null },
+          body: "Summary updated.",
+          createdAt: "2026-10-16T14:11:51.000Z",
+          url: null,
+          path: null,
+          reviewState: null,
+        },
+      ];
+      yield* TestClock.adjust("10 minutes");
+      yield* reactor.sweep;
+      yield* send("queued");
+
+      const runFor = (summary: string) =>
+        Effect.map(orchestrator.getThreadProjection(threadId), ({ runs, messages }) => {
+          const message = messages.find((candidate) => candidate.notification?.summary === summary);
+          return runs.find((run) => run.userMessageId === message?.id)?.status;
+        });
+      assert.equal(yield* runFor("#13: new comments"), "queued");
+      assert.equal(yield* runFor("#14: new comments"), "queued");
+
+      yield* watch(13, false);
+      assert.equal(yield* runFor("#13: new comments"), "cancelled");
+      assert.equal(yield* runFor("#14: new comments"), "queued");
+      const { runs } = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(
+        runs.find((run) => run.userMessageId === "pr-watch-unwatch-queued-queued")?.status,
+        "queued",
+      );
+    }),
+  );
+
   it.effect.each([
     "single page",
     "paginated",

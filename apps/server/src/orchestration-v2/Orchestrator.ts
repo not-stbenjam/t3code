@@ -2372,7 +2372,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           threadId: command.threadId,
           messageId: command.wake.messageId,
           text: command.wake.text,
-          notification: command.wake.notification,
+          notification: {
+            ...command.wake.notification,
+            source: { kind: "monitor", pullRequest: key },
+          },
           attachments: [],
           dispatchMode: { type: "queue_after_active" },
           createdBy: "agent",
@@ -3294,6 +3297,35 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           type: "regenerate",
         }),
       ]);
+    }
+
+    // A wake queued behind a running turn would otherwise start after the watch stopped.
+    if (
+      (command.type === "thread.pull-request.watch" && !command.watching) ||
+      command.type === "thread.pull-request.unlink"
+    ) {
+      const stopped = normalizeThreadPullRequestKey(command);
+      const projection = yield* loadProjectionForCommand(
+        command,
+        ["runs", "attempts", "nodes", "messages"],
+        { turnItemTypes: [], messageRoles: ["user"] },
+      );
+      const wakeIds = new Set(
+        projection.messages
+          .filter((message) => {
+            const source = message.notification?.source;
+            return (
+              source?.kind === "monitor" &&
+              source.pullRequest !== undefined &&
+              threadPullRequestKeysEqual(source.pullRequest, stopped)
+            );
+          })
+          .map((message) => message.id),
+      );
+      for (const run of projection.runs) {
+        if (run.status !== "queued" || !wakeIds.has(run.userMessageId)) continue;
+        yield* emitQueuedRunCancellation({ command, events, projection, run, now });
+      }
     }
 
     if (command.type === "thread.archive") {
